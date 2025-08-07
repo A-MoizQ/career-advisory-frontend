@@ -1,30 +1,26 @@
 import React, { useState, useEffect } from 'react';
 import ApiKeyPage from './components/ApiKeyPage';
+import ModeSelectPage from './components/ModeSelectPage';
+import ChatPage from './components/ChatPage';
 
 function App() {
   const [apiKey, setApiKey] = useState(null);
+  const [mode, setMode] = useState(null);
 
   useEffect(() => {
-    // Retrieve API key from sessionStorage to ensure it clears on browser close
     const key = sessionStorage.getItem('OPENAI_API_KEY');
     if (key) setApiKey(key);
   }, []);
 
-  const handleConnect = () => {
-    setApiKey(sessionStorage.getItem('OPENAI_API_KEY'));
-  };
-
-  // If no API key in sessionStorage, show entry page
   if (!apiKey) {
-    return <ApiKeyPage onConnect={handleConnect} />;
+    return <ApiKeyPage onConnect={() => setApiKey(sessionStorage.getItem('OPENAI_API_KEY'))} />;
   }
 
-  return (
-    <div>
-      {/* Replace with ModeSelectPage once ready */}
-      <p className="text-center mt-10">API Key connected! Proceed to mode selection.</p>
-    </div>
-  );
+  if (!mode) {
+    return <ModeSelectPage onContinue={setMode} />;
+  }
+
+  return <ChatPage mode={mode} onModeChange={setMode} />;
 }
 
 export default App;

@@ -32,6 +32,8 @@ export default function ApiKeyPage({ onConnect }) {
     }
     const ok = await validateKey(key);
     if (ok) {
+      // Clear any old chat history before proceeding
+      localStorage.removeItem('chatHistory');
       sessionStorage.setItem('OPENAI_API_KEY', key);
       onConnect();
     } else {
