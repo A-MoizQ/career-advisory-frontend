@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import pdfToText from 'react-pdftotext';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import axios from 'axios';
 
 const modeOptions = [
@@ -36,7 +37,7 @@ export default function ChatPage({ mode, onModeChange }) {
   }, [messages]);
 
   const handleSend = async (file = null) => {
-    const isFileMessage = Boolean(file);
+    const isFileMessage = file instanceof File;
     // If it's a text message, ensure there's text.
     if (!isFileMessage && !input.trim()) return;
 
@@ -138,6 +139,25 @@ export default function ChatPage({ mode, onModeChange }) {
     }
   };
 
+  // react-markdown v9: use components to set link target/rel
+  const markdownComponents = {
+    a: ({ node, ...props }) => (
+    <a {...props} target="_blank" rel="noopener noreferrer" />
+    ),
+    table: ({ node, ...props }) => (
+      <table className="table-auto w-full text-sm border-collapse my-2" {...props} />
+    ),
+    thead: ({ node, ...props }) => <thead {...props} />,
+    tbody: ({ node, ...props }) => <tbody {...props} />,
+    tr: ({ node, ...props }) => <tr {...props} />,
+    th: ({ node, ...props }) => (
+      <th className="border px-3 py-2 text-left bg-gray-100 font-medium" {...props} />
+    ),
+    td: ({ node, ...props }) => (
+      <td className="border px-3 py-2 align-top" {...props} />
+    ),
+  };
+
   return (
     <div className="flex w-full h-full">
       {/* Sidebar */}
@@ -194,7 +214,9 @@ export default function ChatPage({ mode, onModeChange }) {
         <div ref={containerRef} className="flex-1 p-5 overflow-y-auto flex flex-col space-y-4">
           {messages.map((m, i) => (
             <div key={i} className={`${m.role==='assistant'? 'self-start bg-[#f0f2f5] text-[#333]':'self-end bg-[#2d7ff9] text-white'} max-w-[70%] p-4 rounded-lg leading-relaxed mb-2`}> 
-              {m.content}
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {m.content}
+              </ReactMarkdown>
               <span className={`block text-[11px] opacity-70 mt-2 ${m.role==='assistant'? 'text-left':'text-right'}`}>{m.time}</span>
             </div>
           ))}
@@ -216,7 +238,7 @@ export default function ChatPage({ mode, onModeChange }) {
             <input value={input} onChange={e => setInput(e.target.value)} className="flex-1 bg-transparent outline-none text-sm" placeholder="Type a message..." />
             <i className="ri-emotion-line text-xl text-[#2d7ff9] ml-3 cursor-pointer" />
           </div>
-          <button onClick={handleSend} className="ml-4 bg-[#2d7ff9] w-10 h-10 rounded-full flex items-center justify-center text-white">
+          <button onClick={() => handleSend()} className="ml-4 bg-[#2d7ff9] w-10 h-10 rounded-full flex items-center justify-center text-white">
             <i className="ri-send-plane-fill text-lg" />
           </button>
         </div>
