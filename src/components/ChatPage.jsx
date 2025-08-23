@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
+import axios from 'axios';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import axios from 'axios';
 
 const modeOptions = [
   'career_advice',
@@ -11,6 +11,15 @@ const modeOptions = [
   'mock_interview'
 ];
 
+// Helper: robust file check
+const isRealFile = (x) =>
+  x instanceof File ||
+  (x &&
+    typeof x === 'object' &&
+    typeof x.name === 'string' &&
+    typeof x.size === 'number' &&
+    typeof x.type === 'string');
+
 export default function ChatPage({ mode, onModeChange }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -18,8 +27,10 @@ export default function ChatPage({ mode, onModeChange }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
   const [newApiKey, setNewApiKey] = useState('');
+  const [clarifyingQuestions, setClarifyingQuestions] = useState([]); // array of { id, question, ... }
+  const [clarifyingAnswers, setClarifyingAnswers] = useState({}); // map id -> answer string
+  const [sessionId, setSessionId] = useState(() => sessionStorage.getItem(`session_${mode}`) || null);
   const containerRef = useRef(null);
-  const API_KEY = sessionStorage.getItem('OPENAI_API_KEY');
   const MAX_HISTORY = 10; // max messages to keep in context
 
   // load history
@@ -27,6 +38,14 @@ export default function ChatPage({ mode, onModeChange }) {
     const stored = JSON.parse(localStorage.getItem('chatHistory') || '[]');
     setMessages(stored);
   }, []);
+
+  // when mode changes, load session id for that mode and clear clarifying UI
+  useEffect(() => {
+    const sid = sessionStorage.getItem(`session_${mode}`);
+    setSessionId(sid || null);
+    setClarifyingQuestions([]);
+    setClarifyingAnswers({});
+  }, [mode]);
 
   // save history and scroll
   useEffect(() => {
@@ -36,10 +55,13 @@ export default function ChatPage({ mode, onModeChange }) {
     }
   }, [messages]);
 
-  const handleSend = async (file = null) => {
-    const isFileMessage = file instanceof File;
-    // If it's a text message, ensure there's text.
-    if (!isFileMessage && !input.trim()) return;
+  const pushMessage = (msg) => {
+    setMessages(prev => [...prev, msg].slice(-MAX_HISTORY));
+  };
+
+  const handleSend = async (file = null, answers = null) => {
+    const isFileMessage = Boolean(file);
+    if (!isFileMessage && !input.trim() && !answers) return;
 
     const userApiKey = sessionStorage.getItem('OPENAI_API_KEY');
     if (!userApiKey) {
@@ -47,21 +69,26 @@ export default function ChatPage({ mode, onModeChange }) {
       return;
     }
 
-    // Add user's text message to the chat UI immediately
-    if (!isFileMessage) {
+    // Add user message to chat (unless it's clarifying answers)
+    if (answers) {
+      // Show a compact message summarizing answers
+      const summary = Object.entries(answers).map(([k, v]) => `${k}: ${v}`).join('\n');
+      pushMessage({ role: 'user', content: `Answered clarifying questions:\n${summary}`, time: new Date().toLocaleTimeString() });
+    } else if (!isFileMessage) {
       const userMsg = { role: 'user', content: input, time: new Date().toLocaleTimeString() };
-      setMessages(prev => [...prev, userMsg].slice(-MAX_HISTORY));
+      pushMessage(userMsg);
     }
-    
-    // Prepare messages for the API call. Exclude the latest message if it's a file upload,
-    // as the file content will be handled separately.
+
+    // Prepare messages for the API call. Use last MAX_HISTORY messages
     const messagesForApi = messages.slice(-MAX_HISTORY).map(m => ({
       role: m.role,
       content: m.content
     }));
 
-    // If it's a text message, add it to the API payload.
-    if (!isFileMessage) {
+    // If it's a text message and the local 'input' wasn't already in the messages slice, add it
+    if (!isFileMessage && !answers) {
+      // we already pushed the user message above, but messages variable isn't updated instantly.
+      // include the input explicitly to be safe
       messagesForApi.push({ role: 'user', content: input });
     }
 
@@ -72,61 +99,83 @@ export default function ChatPage({ mode, onModeChange }) {
       const formData = new FormData();
       formData.append('api_key', userApiKey);
       formData.append('mode', mode);
-      // Messages need to be stringified to be sent in a FormData object
       formData.append('messages', JSON.stringify(messagesForApi));
-      
+      if (sessionId) {
+        formData.append('session_id', sessionId);
+      }
+      if (answers) {
+        formData.append('answers', JSON.stringify(answers));
+      }
       if (isFileMessage) {
         formData.append('file', file);
       }
 
-      const resp = await axios.post('/chat', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      });
+      // Let axios set the multipart boundary automatically
+      const resp = await axios.post('/chat', formData);
 
-      const botReply = resp.data.reply;
+      const data = resp.data;
+      const botReply = data.reply;
       const botMsg = { role: 'assistant', content: botReply, time: new Date().toLocaleTimeString() };
-      setMessages(prev => [...prev, botMsg].slice(-MAX_HISTORY));
-    } catch (error) {
-      const errorDetail = error.response?.data?.detail;
-      let errorMessage = 'Error: failed to get response from the server.';
-      if (typeof errorDetail === 'string') {
-        errorMessage = errorDetail;
-      } else if (errorDetail?.error?.message) {
-        errorMessage = errorDetail.error.message;
-      }
-      setMessages(prev => [...prev, { role: 'assistant', content: errorMessage, time: new Date().toLocaleTimeString() }].slice(-MAX_HISTORY));
-    }
-    setLoading(false);
-  };
+      pushMessage(botMsg);
 
+      // Handle clarifying questions
+      if (data.clarifying_questions && data.clarifying_questions.length > 0) {
+        setClarifyingQuestions(data.clarifying_questions);
+        setClarifyingAnswers({}); // Reset answers
+      } else {
+        setClarifyingQuestions([]);
+        setClarifyingAnswers({});
+      }
+
+      // Handle session ID
+      if (data.session_id) {
+        setSessionId(data.session_id);
+        sessionStorage.setItem(`session_${mode}`, data.session_id);
+      }
+
+    } catch (error) {
+      const detail = error?.response?.data?.detail;
+      const status = error?.response?.status;
+      let errorMessage = 'Error: failed to get response from the server.';
+      if (status === 422) {
+        errorMessage = `Validation error: ${JSON.stringify(detail)}`;
+      } else if (typeof detail === 'string') {
+        errorMessage = detail;
+      } else if (detail?.error?.message) {
+        errorMessage = detail.error.message;
+      }
+      pushMessage({ role: 'assistant', content: errorMessage, time: new Date().toLocaleTimeString() });
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleFileClick = () => {
     document.getElementById('file-input').click();
   };
 
   const handleFileChange = async (e) => {
-    const file = e.target.files[0];
+    const file = e.target.files?.[0];
     if (!file) return;
 
     if (file.type !== 'application/pdf') {
-      const errorMessage = `Sorry, only PDF files are supported for upload.`;
-      const errorMsg = { role: 'assistant', content: errorMessage, time: new Date().toLocaleTimeString() };
-      setMessages(prev => [...prev, errorMsg].slice(-MAX_HISTORY));
+      const errorMsg = { role: 'assistant', content: 'Sorry, only PDF files are supported for upload.', time: new Date().toLocaleTimeString() };
+      pushMessage(errorMsg);
+      e.target.value = '';
       return;
     }
 
-    // Show a message in the chat that the file is being uploaded and processed
     const fileUploadMsg = { 
       role: 'user', 
-      content: `Uploading "${file.name}" for review...`, 
+      content: `📄 Uploading "${file.name}" for analysis...`, 
       time: new Date().toLocaleTimeString() 
     };
-    setMessages(prev => [...prev, fileUploadMsg].slice(-MAX_HISTORY));
+    pushMessage(fileUploadMsg);
 
-    // Call handleSend with the file
     await handleSend(file);
+
+    // Allow re-uploading the same file
+    e.target.value = '';
   };
 
   const handleUpdateApiKey = () => {
@@ -134,15 +183,43 @@ export default function ChatPage({ mode, onModeChange }) {
       sessionStorage.setItem('OPENAI_API_KEY', newApiKey.trim());
       setApiKeyModalOpen(false);
       setNewApiKey('');
-      // Force page reload to update API_KEY constant
       window.location.reload();
     }
   };
 
-  // react-markdown v9: use components to set link target/rel
+  const submitClarifyingAnswers = async () => {
+    // Validate that required questions are answered
+    const answersToSend = {};
+    let hasErrors = false;
+
+    clarifyingQuestions.forEach(q => {
+      const answer = clarifyingAnswers[q.id] || '';
+      if (q.required && !answer.trim()) {
+        hasErrors = true;
+        return;
+      }
+      if (answer.trim()) {
+        answersToSend[q.id] = answer.trim();
+      }
+    });
+
+    if (hasErrors) {
+      pushMessage({ 
+        role: 'assistant', 
+        content: 'Please answer all required questions before proceeding.', 
+        time: new Date().toLocaleTimeString() 
+      });
+      return;
+    }
+
+    if (Object.keys(answersToSend).length === 0) return;
+    await handleSend(null, answersToSend);
+  };
+
+  // react-markdown v9: use components to set link target/rel and table styling
   const markdownComponents = {
     a: ({ node, ...props }) => (
-    <a {...props} target="_blank" rel="noopener noreferrer" />
+      <a {...props} target="_blank" rel="noopener noreferrer" />
     ),
     table: ({ node, ...props }) => (
       <table className="table-auto w-full text-sm border-collapse my-2" {...props} />
@@ -174,21 +251,21 @@ export default function ChatPage({ mode, onModeChange }) {
           </div>
           {menuOpen && (
             <div className="absolute bg-white rounded-lg shadow-xl w-full z-10 border border-gray-200 overflow-hidden">
-                {modeOptions.map((opt, index) => (
+              {modeOptions.map((opt, index) => (
                 <div 
-                    key={opt} 
-                    onClick={() => { onModeChange(opt); setMenuOpen(false); }} 
-                    className={`py-3 cursor-pointer capitalize transition-all duration-200 font-medium border-l-4 ${
+                  key={opt} 
+                  onClick={() => { onModeChange(opt); setMenuOpen(false); }} 
+                  className={`py-3 cursor-pointer capitalize transition-all duration-200 font-medium border-l-4 ${
                     opt === mode 
-                        ? 'bg-[#e6f2ff] text-[#2d7ff9] border-l-[#2d7ff9] font-semibold pl-3 pr-4' 
-                        : 'text-gray-700 border-l-transparent px-4 hover:bg-[#2d7ff9] hover:text-white'
-                    } ${index !== modeOptions.length - 1 ? 'border-b border-b-gray-100' : ''}`}
+                      ? 'bg-[#e6f2ff] text-[#2d7ff9] border-l-[#2d7ff9] font-semibold pl-3 pr-4' 
+                      : 'text-gray-700 border-l-transparent px-4 hover:bg-[#2d7ff9] hover:text-white'
+                  } ${index !== modeOptions.length - 1 ? 'border-b border-b-gray-100' : ''}`}
                 >
-                    {opt.replace('_', ' ')}
+                  {opt.replace('_', ' ')}
                 </div>
-                ))}
+              ))}
             </div>
-        )}
+          )}
         </div>
         <div className="mt-auto text-xs opacity-50 text-center">
           © 2025 Career Assistant AI<br />Version 1.0.0
@@ -205,7 +282,7 @@ export default function ChatPage({ mode, onModeChange }) {
           <button 
             onClick={() => setApiKeyModalOpen(true)}
             className="flex items-center px-3 py-2 bg-[#2d7ff9] text-white rounded-lg hover:bg-[#1e5bb8] transition-all duration-200 text-sm font-medium"
-            >
+          >
             <i className="ri-key-line text-lg mr-2" />
             Change API Key
           </button>
@@ -229,16 +306,65 @@ export default function ChatPage({ mode, onModeChange }) {
               </div>
             </div>
           )}
+
+          {/* Clarifying Questions UI */}
+          {clarifyingQuestions.length > 0 && (
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 max-w-[90%] self-start">
+              <h3 className="font-semibold text-blue-900 mb-3 flex items-center">
+                <i className="ri-question-line mr-2" />
+                Please provide more details:
+              </h3>
+              <div className="space-y-4">
+                {clarifyingQuestions.map((q, idx) => (
+                  <div key={q.id} className="space-y-2">
+                    <label className="block text-sm font-medium text-blue-800">
+                      {idx + 1}. {q.question}
+                      {q.required && <span className="text-red-500 ml-1">*</span>}
+                    </label>
+                    {q.hint && (
+                      <p className="text-xs text-blue-600 italic">{q.hint}</p>
+                    )}
+                    <textarea
+                      value={clarifyingAnswers[q.id] || ''}
+                      onChange={(e) => setClarifyingAnswers(prev => ({...prev, [q.id]: e.target.value}))}
+                      className="w-full p-2 border border-blue-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+                      rows={2}
+                      placeholder={q.hint || "Enter your answer..."}
+                    />
+                  </div>
+                ))}
+                <button
+                  onClick={submitClarifyingAnswers}
+                  disabled={loading}
+                  className="bg-[#2d7ff9] text-white px-4 py-2 rounded-lg hover:bg-[#1e5bb8] transition-colors disabled:opacity-50 flex items-center"
+                >
+                  <i className="ri-send-plane-fill mr-2" />
+                  Submit Answers
+                </button>
+              </div>
+            </div>
+          )}
         </div>
         
         <div className="border-t p-4 flex items-center">
           <input id="file-input" type="file" className="hidden" onChange={handleFileChange} />
           <div className="flex-1 bg-[#f0f2f5] rounded-full px-4 py-2 flex items-center">
             <i onClick={handleFileClick} className="ri-attachment-2 text-xl text-[#2d7ff9] mr-3 cursor-pointer" />
-            <input value={input} onChange={e => setInput(e.target.value)} className="flex-1 bg-transparent outline-none text-sm" placeholder="Type a message..." />
+            <input 
+              value={input} 
+              onChange={e => setInput(e.target.value)} 
+              onKeyPress={e => e.key === 'Enter' && handleSend()}
+              className="flex-1 bg-transparent outline-none text-sm" 
+              placeholder="Type a message..." 
+              disabled={clarifyingQuestions.length > 0}
+            />
             <i className="ri-emotion-line text-xl text-[#2d7ff9] ml-3 cursor-pointer" />
           </div>
-          <button onClick={() => handleSend()} className="ml-4 bg-[#2d7ff9] w-10 h-10 rounded-full flex items-center justify-center text-white">
+          <button 
+            onClick={() => handleSend()} 
+            disabled={clarifyingQuestions.length > 0}
+            className="ml-4 bg-[#2d7ff9] w-10 h-10 rounded-full flex items-center justify-center text-white disabled:opacity-50"
+          >
             <i className="ri-send-plane-fill text-lg" />
           </button>
         </div>
