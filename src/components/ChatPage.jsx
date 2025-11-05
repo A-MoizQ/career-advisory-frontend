@@ -1,15 +1,22 @@
-import React, { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import apiClient from '../lib/apiClient';
 
 const modeOptions = [
   'career_advice',
   'resume_review',
   'job_hunt',
   'learning_roadmap',
-  'mock_interview'
+  'mock_interview',
 ];
+
+const formatTime = () => new Date().toLocaleTimeString();
+
+const formatWarnings = (warnings) =>
+  warnings && warnings.length
+    ? `⚠️ **Important notes:**\n${warnings.map((warning) => `- ${warning}`).join('\n')}`
+    : '';
 
 // Helper: robust file check
 const isRealFile = (x) =>
@@ -31,13 +38,24 @@ export default function ChatPage({ mode, onModeChange }) {
   const [clarifyingAnswers, setClarifyingAnswers] = useState({}); // map id -> answer string
   const [sessionId, setSessionId] = useState(() => sessionStorage.getItem(`session_${mode}`) || null);
   const containerRef = useRef(null);
-  const MAX_HISTORY = 10; // max messages to keep in context
+  const MAX_HISTORY = 12; // max messages to keep in context
+  const storageKey = useMemo(() => `chatHistory_${mode}`, [mode]);
 
-  // load history
   useEffect(() => {
-    const stored = JSON.parse(localStorage.getItem('chatHistory') || '[]');
-    setMessages(stored);
-  }, []);
+    let initialMessages = [];
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          initialMessages = parsed;
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to load cached messages', err);
+    }
+    setMessages(initialMessages);
+  }, [storageKey]);
 
   // when mode changes, load session id for that mode and clear clarifying UI
   useEffect(() => {
@@ -49,15 +67,20 @@ export default function ChatPage({ mode, onModeChange }) {
 
   // save history and scroll
   useEffect(() => {
-    localStorage.setItem('chatHistory', JSON.stringify(messages));
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(messages));
+    } catch (err) {
+      console.warn('Failed to persist chat history', err);
+    }
     if (containerRef.current) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, storageKey]);
 
-  const pushMessage = (msg) => {
-    setMessages(prev => [...prev, msg].slice(-MAX_HISTORY));
-  };
+  const appendMessages = useCallback((newMessages) => {
+    if (!newMessages || newMessages.length === 0) return;
+    setMessages((prev) => [...prev, ...newMessages].slice(-MAX_HISTORY));
+  }, []);
 
   const handleSend = async (file = null, answers = null) => {
     const isFileMessage = Boolean(file);
@@ -69,28 +92,29 @@ export default function ChatPage({ mode, onModeChange }) {
       return;
     }
 
-    // Add user message to chat (unless it's clarifying answers)
+    const newUserMessages = [];
     if (answers) {
-      // Show a compact message summarizing answers
-      const summary = Object.entries(answers).map(([k, v]) => `${k}: ${v}`).join('\n');
-      pushMessage({ role: 'user', content: `Answered clarifying questions:\n${summary}`, time: new Date().toLocaleTimeString() });
-    } else if (!isFileMessage) {
-      const userMsg = { role: 'user', content: input, time: new Date().toLocaleTimeString() };
-      pushMessage(userMsg);
+      const summary = Object.entries(answers)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n');
+      if (summary) {
+        newUserMessages.push({
+          role: 'user',
+          content: `Submitted clarifying details:\n${summary}`,
+          time: formatTime(),
+        });
+      }
+    } else if (!isFileMessage && input.trim()) {
+      newUserMessages.push({ role: 'user', content: input.trim(), time: formatTime() });
     }
 
-    // Prepare messages for the API call. Use last MAX_HISTORY messages
-    const messagesForApi = messages.slice(-MAX_HISTORY).map(m => ({
-      role: m.role,
-      content: m.content
-    }));
-
-    // If it's a text message and the local 'input' wasn't already in the messages slice, add it
-    if (!isFileMessage && !answers) {
-      // we already pushed the user message above, but messages variable isn't updated instantly.
-      // include the input explicitly to be safe
-      messagesForApi.push({ role: 'user', content: input });
+    if (newUserMessages.length) {
+      appendMessages(newUserMessages);
     }
+
+    const historyForApi = [...messages, ...newUserMessages]
+      .slice(-MAX_HISTORY)
+      .map(({ role, content }) => ({ role, content }));
 
     setInput('');
     setLoading(true);
@@ -99,7 +123,7 @@ export default function ChatPage({ mode, onModeChange }) {
       const formData = new FormData();
       formData.append('api_key', userApiKey);
       formData.append('mode', mode);
-      formData.append('messages', JSON.stringify(messagesForApi));
+      formData.append('messages', JSON.stringify(historyForApi));
       if (sessionId) {
         formData.append('session_id', sessionId);
       }
@@ -111,16 +135,25 @@ export default function ChatPage({ mode, onModeChange }) {
       }
 
       // Let axios set the multipart boundary automatically
-      const resp = await axios.post('/chat', formData);
+      const { data } = await apiClient.post('/chat', formData);
 
-      const data = resp.data;
-      const botReply = data.reply;
-      const botMsg = { role: 'assistant', content: botReply, time: new Date().toLocaleTimeString() };
-      pushMessage(botMsg);
+      const botReply = typeof data.reply === 'string' && data.reply.trim().length > 0
+        ? data.reply
+        : 'I did not receive a response. Please try again in a moment.';
+      appendMessages([{ role: 'assistant', content: botReply, time: formatTime() }]);
 
-      // Handle clarifying questions
-      if (data.clarifying_questions && data.clarifying_questions.length > 0) {
-        setClarifyingQuestions(data.clarifying_questions);
+      if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+        appendMessages([{ role: 'assistant', content: formatWarnings(data.warnings), time: formatTime() }]);
+      }
+
+      const pendingQuestions = Array.isArray(data.clarifying_questions)
+        ? data.clarifying_questions
+        : Array.isArray(data.pending_questions)
+          ? data.pending_questions
+          : [];
+
+      if (pendingQuestions.length > 0) {
+        setClarifyingQuestions(pendingQuestions);
         setClarifyingAnswers({}); // Reset answers
       } else {
         setClarifyingQuestions([]);
@@ -144,7 +177,7 @@ export default function ChatPage({ mode, onModeChange }) {
       } else if (detail?.error?.message) {
         errorMessage = detail.error.message;
       }
-      pushMessage({ role: 'assistant', content: errorMessage, time: new Date().toLocaleTimeString() });
+      appendMessages([{ role: 'assistant', content: errorMessage, time: formatTime() }]);
     } finally {
       setLoading(false);
     }
@@ -158,9 +191,15 @@ export default function ChatPage({ mode, onModeChange }) {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    if (!isRealFile(file)) {
+      appendMessages([{ role: 'assistant', content: 'The selected file could not be read. Please try another PDF.', time: formatTime() }]);
+      e.target.value = '';
+      return;
+    }
+
     if (file.type !== 'application/pdf') {
-      const errorMsg = { role: 'assistant', content: 'Sorry, only PDF files are supported for upload.', time: new Date().toLocaleTimeString() };
-      pushMessage(errorMsg);
+      const errorMsg = { role: 'assistant', content: 'Sorry, only PDF files are supported for upload.', time: formatTime() };
+      appendMessages([errorMsg]);
       e.target.value = '';
       return;
     }
@@ -168,9 +207,9 @@ export default function ChatPage({ mode, onModeChange }) {
     const fileUploadMsg = { 
       role: 'user', 
       content: `📄 Uploading "${file.name}" for analysis...`, 
-      time: new Date().toLocaleTimeString() 
+      time: formatTime() 
     };
-    pushMessage(fileUploadMsg);
+    appendMessages([fileUploadMsg]);
 
     await handleSend(file);
 
@@ -204,16 +243,29 @@ export default function ChatPage({ mode, onModeChange }) {
     });
 
     if (hasErrors) {
-      pushMessage({ 
+      appendMessages([{ 
         role: 'assistant', 
         content: 'Please answer all required questions before proceeding.', 
-        time: new Date().toLocaleTimeString() 
-      });
+        time: formatTime(),
+      }]);
       return;
     }
 
     if (Object.keys(answersToSend).length === 0) return;
     await handleSend(null, answersToSend);
+  };
+
+  const handleResetSession = () => {
+    sessionStorage.removeItem(`session_${mode}`);
+    setSessionId(null);
+    setClarifyingQuestions([]);
+    setClarifyingAnswers({});
+    setMessages([]);
+    try {
+      localStorage.removeItem(storageKey);
+    } catch (err) {
+      console.warn('Failed to clear stored messages for mode', mode, err);
+    }
   };
 
   // react-markdown v9: use components to set link target/rel and table styling
@@ -279,13 +331,22 @@ export default function ChatPage({ mode, onModeChange }) {
             <i className="ri-briefcase-4-line text-2xl text-[#2d7ff9] mr-3" />
             <h2 className="text-lg font-medium text-[#333] capitalize">{mode.replace('_', ' ')} Mode</h2>
           </div>
-          <button 
-            onClick={() => setApiKeyModalOpen(true)}
-            className="flex items-center px-3 py-2 bg-[#2d7ff9] text-white rounded-lg hover:bg-[#1e5bb8] transition-all duration-200 text-sm font-medium"
-          >
-            <i className="ri-key-line text-lg mr-2" />
-            Change API Key
-          </button>
+          <div className="flex items-center gap-3">
+            <button 
+              onClick={handleResetSession}
+              className="px-3 py-2 border border-[#2d7ff9] text-[#2d7ff9] rounded-lg hover:bg-[#e6f2ff] transition-all duration-200 text-sm font-medium"
+            >
+              <i className="ri-refresh-line mr-2" />
+              Reset Session
+            </button>
+            <button 
+              onClick={() => setApiKeyModalOpen(true)}
+              className="flex items-center px-3 py-2 bg-[#2d7ff9] text-white rounded-lg hover:bg-[#1e5bb8] transition-all duration-200 text-sm font-medium"
+            >
+              <i className="ri-key-line text-lg mr-2" />
+              Change API Key
+            </button>
+          </div>
         </div>
         
         <div ref={containerRef} className="flex-1 p-5 overflow-y-auto flex flex-col space-y-4">

@@ -5,6 +5,24 @@ export default function ApiKeyPage({ onConnect }) {
   const [apiKey, setApiKey] = useState('');
   const [error, setError] = useState('');
 
+  const clearConversationState = () => {
+    try {
+      Object.keys(localStorage)
+        .filter((key) => key.startsWith('chatHistory_'))
+        .forEach((key) => localStorage.removeItem(key));
+    } catch (err) {
+      console.warn('Failed to clear cached chat history', err);
+    }
+
+    try {
+      Object.keys(sessionStorage)
+        .filter((key) => key.startsWith('session_'))
+        .forEach((key) => sessionStorage.removeItem(key));
+    } catch (err) {
+      console.warn('Failed to clear cached sessions', err);
+    }
+  };
+
   const validateKey = async (key) => {
     try {
       const resp = await axios.post(
@@ -32,8 +50,8 @@ export default function ApiKeyPage({ onConnect }) {
     }
     const ok = await validateKey(key);
     if (ok) {
-      // Clear any old chat history before proceeding
-      localStorage.removeItem('chatHistory');
+      // Clear any old chat history and session state before proceeding
+      clearConversationState();
       sessionStorage.setItem('OPENAI_API_KEY', key);
       onConnect();
     } else {
